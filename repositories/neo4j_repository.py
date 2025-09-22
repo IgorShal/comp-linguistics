@@ -1,3 +1,4 @@
+
 import json
 import uuid
 from typing import List, Dict, Any, Optional
@@ -39,7 +40,6 @@ class Neo4jRepository:
         """
         if not props:
             return "", {}
-        # we use a map parameter `props_map`
         return "{props_map}", {"props_map": props}
 
     def get_all_nodes(self) -> List[TNode]:
@@ -71,7 +71,6 @@ class Neo4jRepository:
                 targets = r["targets"] or []
                 node_dict = self.collect_node(n)
                 arcs_list = []
-                # rels and targets are parallel lists
                 for rel, target in zip(rels, targets):
                     if rel is None:
                         continue
@@ -115,10 +114,9 @@ class Neo4jRepository:
         if labels:
             label_part = ':' + self.transform_labels(labels, separator=':')
         props_text, cy_params = self.transform_props(params)
-        # Use a map param to create node properties
-        q = f"CREATE (n{label_part} {props_text}) RETURN n"
+        q = f"CREATE (n{label_part} $props) RETURN n"
         with self._driver.session() as sess:
-            res = sess.run(q, cy_params)
+            res = sess.run(q, {"props": params})
             rec = res.single()
             n = rec["n"]
             return self.collect_node(n)
@@ -131,7 +129,6 @@ class Neo4jRepository:
         """
         rel_type_safe = rel_type if _LABEL_RE.match(rel_type) else "RELATED"
         props = props or {}
-        # We can't parametrize relationship type name, so validate
         rel_type_cy = _safe_label(rel_type_safe)
         q = f"""
         MATCH (a {{uri: $uri1}}), (b {{uri: $uri2}})
@@ -161,10 +158,10 @@ class Neo4jRepository:
             rec = res.single()
             return bool(rec and rec["cnt"] and rec["cnt"] > 0)
 
-    def delete_arc_by_id(self, arc_id: int) -> bool:
-        q = "MATCH ()-[r]-() WHERE id(r) = $rid DELETE r RETURN COUNT(r) as cnt"
+    def delete_arc_by_element_id(self, arc_eid: str) -> bool:
+        q = "MATCH ()-[r]-() WHERE elementId(r) = $rid DELETE r RETURN COUNT(r) as cnt"
         with self._driver.session() as sess:
-            res = sess.run(q, {"rid": arc_id})
+            res = sess.run(q, {"rid": arc_eid})
             rec = res.single()
             return bool(rec and rec["cnt"] and rec["cnt"] > 0)
 
@@ -178,16 +175,13 @@ class Neo4jRepository:
             raise RepositoryError("Nothing to update provided.")
         queries = []
         params = {"uri": uri}
-        # update props
         if props:
             queries.append("SET n += $props")
             params["props"] = props
         if set_labels:
-            # add labels by dynamic cypher
             add_labels = ":" + self.transform_labels(set_labels, separator=':')
             queries.append(f"SET n{add_labels}")
         if remove_labels:
-            # remove labels
             for lbl in remove_labels:
                 lbl_safe = _safe_label(lbl)
                 queries.append(f"REMOVE n:{lbl_safe}")
@@ -209,40 +203,28 @@ class Neo4jRepository:
             res = sess.run(query, params)
             out = []
             for r in res:
-                # convert record to a plain dict
                 rec = {}
                 for k in r.keys():
                     rec[k] = self._convert_value(r[k])
                 out.append(rec)
             return out
 
-    # -----------------------
-    # Collectors
-    # -----------------------
+
     def collect_node(self, node_obj) -> TNode:
-        """
-        Transforms a neo4j.types.graph.Node into TNode dict.
-        Accepts both Node objects and mapping-like structures.
-        """
-        # Neo4j Node has .id and keys accessible via mapping
         try:
-            nid = node_obj.id
+            nid = node_obj.element_id
         except Exception:
-            # fallback: maybe record mapping
-            nid = node_obj.get("id", None)
+            nid = node_obj.element_id
         data = {"id": nid}
-        # try to get uri/title/description, but include arbitrary props
         try:
             for k in node_obj.keys():
                 data[k] = self._convert_value(node_obj[k])
         except Exception:
-            # if not mapping-like, try to cast to dict
             try:
                 for k, v in dict(node_obj).items():
                     data[k] = self._convert_value(v)
             except Exception:
                 pass
-        # ensure fields exist
         data.setdefault("uri", data.get("uri", None))
         data.setdefault("title", data.get("title", None))
         data.setdefault("description", data.get("description", None))
@@ -254,16 +236,14 @@ class Neo4jRepository:
         If target_node provided, attempt to read its uri for node_uri_to.
         """
         try:
-            rid = rel_obj.id
+            rid = rel_obj.element_id
         except Exception:
             rid = None
         rel_type = type(rel_obj).__name__
         try:
             rel_type = rel_obj.type
         except Exception:
-            # fallback: use class name
             pass
-        # get properties from relationship
         props = {}
         try:
             for k in rel_obj.keys():
@@ -273,13 +253,11 @@ class Neo4jRepository:
         node_from_uri = None
         node_to_uri = None
         try:
-            # relationship has start_node and end_node
             sn = rel_obj.start_node
             en = rel_obj.end_node
             node_from_uri = sn.get("uri", None)
             node_to_uri = en.get("uri", None)
         except Exception:
-            # maybe target_node provided only
             if target_node is not None:
                 node_to_uri = target_node.get("uri", None)
         arc = {
@@ -288,7 +266,6 @@ class Neo4jRepository:
             "node_uri_from": node_from_uri,
             "node_uri_to": node_to_uri,
         }
-        # include props if any
         if props:
             arc["props"] = props
         return arc
@@ -304,34 +281,30 @@ class Neo4jRepository:
                 return str(v)
         except Exception:
             pass
-        # if node
         try:
-            # a Node has .id and .keys
             if hasattr(v, "id") and hasattr(v, "keys"):
                 return self.collect_node(v)
         except Exception:
             pass
-        # if Relationship
         try:
             if hasattr(v, "type") and hasattr(v, "start_node"):
                 return self.collect_arc(v)
         except Exception:
             pass
-        # lists/maps -> recurse
         if isinstance(v, dict):
             return {kk: self._convert_value(vv) for kk, vv in v.items()}
         if isinstance(v, list) or isinstance(v, tuple):
             return [self._convert_value(x) for x in v]
-        # fallback primitives
         return v
 
 
 if __name__ == "__main__":
     import os
-
-    NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-    NEO4J_PASS = os.getenv("NEO4J_PASS", "test")
+    import dotenv
+    dotenv.load_dotenv()
+    NEO4J_URI = os.getenv("NEO4J_URI")
+    NEO4J_USER = os.getenv("NEO4J_USER")
+    NEO4J_PASS = os.getenv("NEO4J_PASSWORD")
 
     repo = Neo4jRepository(NEO4J_URI, NEO4J_USER, NEO4J_PASS)
     try:
@@ -359,7 +332,7 @@ if __name__ == "__main__":
 
         print("Cleanup: delete arc by id and nodes")
         if isinstance(arc.get("id"), int):
-            repo.delete_arc_by_id(arc["id"])
+            repo.delete_arc_by_element_id(arc["id"])
         repo.delete_node_by_uri("node-a-001")
         repo.delete_node_by_uri("node-b-001")
     finally:
