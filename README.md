@@ -1,1 +1,1 @@
-# compLinguistics
+# comp-linguistics
