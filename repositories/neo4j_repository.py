@@ -10,8 +10,10 @@ from utils.repository_error import RepositoryError
 
 
 class Neo4jRepository:
-    def __init__(self, uri: str, user: str, password: str, encrypted: bool = False):
+    def __init__(self, uri: str, user: str, password: str, encrypted: bool = False,
+                 base_uri: str = "http://localhost:7474/db/data/node/"):
         self._driver: Driver = GraphDatabase.driver(uri, auth=(user, password), encrypted=encrypted)
+        self.base_uri = base_uri.rstrip("/") + "/"
 
     def close(self):
         self._driver.close()
@@ -109,7 +111,9 @@ class Neo4jRepository:
         Returns created node dict.
         """
         if "uri" not in params:
-            params["uri"] = self.generate_random_string()
+            params["uri"] = self.base_uri + self.generate_random_string()
+        elif not params["uri"].startswith("http"):
+            params["uri"] = self.base_uri + params["uri"]
         label_part = ''
         if labels:
             label_part = ':' + self.transform_labels(labels, separator=':')
@@ -127,6 +131,10 @@ class Neo4jRepository:
         rel_type will be validated (only letters/numbers/_ allowed).
         Returns created arc dict.
         """
+        if not node1_uri.startswith("http"):
+            node1_uri = self.base_uri + node1_uri
+        if not node2_uri.startswith("http"):
+            node2_uri = self.base_uri + node2_uri
         rel_type_safe = rel_type if _LABEL_RE.match(rel_type) else "RELATED"
         props = props or {}
         rel_type_cy = _safe_label(rel_type_safe)
@@ -211,11 +219,17 @@ class Neo4jRepository:
 
 
     def collect_node(self, node_obj) -> TNode:
+        """
+        Возвращает TNode с единственным идентификатором `id` = element_id (строка).
+        Убираем legacy numeric id.
+        """
         try:
-            nid = node_obj.element_id
+            eid = node_obj.element_id
         except Exception:
-            nid = node_obj.element_id
-        data = {"id": nid}
+            eid = None
+        data = {"id": eid}
+
+
         try:
             for k in node_obj.keys():
                 data[k] = self._convert_value(node_obj[k])
@@ -225,6 +239,7 @@ class Neo4jRepository:
                     data[k] = self._convert_value(v)
             except Exception:
                 pass
+
         data.setdefault("uri", data.get("uri", None))
         data.setdefault("title", data.get("title", None))
         data.setdefault("description", data.get("description", None))
@@ -236,20 +251,19 @@ class Neo4jRepository:
         If target_node provided, attempt to read its uri for node_uri_to.
         """
         try:
-            rid = rel_obj.element_id
+            eid = rel_obj.element_id
         except Exception:
-            rid = None
-        rel_type = type(rel_obj).__name__
-        try:
-            rel_type = rel_obj.type
-        except Exception:
-            pass
+            eid = None
+
+        rel_type = getattr(rel_obj, "type", None) or type(rel_obj).__name__
+
         props = {}
         try:
             for k in rel_obj.keys():
                 props[k] = self._convert_value(rel_obj[k])
         except Exception:
             pass
+
         node_from_uri = None
         node_to_uri = None
         try:
@@ -260,8 +274,9 @@ class Neo4jRepository:
         except Exception:
             if target_node is not None:
                 node_to_uri = target_node.get("uri", None)
+
         arc = {
-            "id": rid,
+            "id": eid,
             "uri": rel_type,
             "node_uri_from": node_from_uri,
             "node_uri_to": node_to_uri,
@@ -330,8 +345,8 @@ if __name__ == "__main__":
         res = repo.run_custom_query("MATCH (n:Test) RETURN count(n) as cnt")
         print(res)
 
-        print("Cleanup: delete arc by id and nodes")
-        if isinstance(arc.get("id"), int):
+        print("Cleanup: delete arc by element_id and nodes")
+        if isinstance(arc.get("id"), str) and arc.get("id"):
             repo.delete_arc_by_element_id(arc["id"])
         repo.delete_node_by_uri("node-a-001")
         repo.delete_node_by_uri("node-b-001")
