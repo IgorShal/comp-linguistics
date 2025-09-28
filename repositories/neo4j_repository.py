@@ -10,6 +10,16 @@ from utils.repository_error import RepositoryError
 
 
 class Neo4jRepository:
+    CLASS_LABEL = "Class"
+    OBJECT_LABEL = "Object"
+    DATATYPE_PROPERTY_LABEL = "DatatypeProperty"
+    OBJECT_PROPERTY_LABEL = "ObjectProperty"
+
+    REL_SUBCLASS = "SUBCLASS_OF"  # child -[:SUBCLASS_OF]-> parent
+    REL_PROPERTY_DOMAIN = "PROPERTY_DOMAIN"  # (prop)-[:PROPERTY_DOMAIN]->(class)
+    REL_PROPERTY_RANGE = "PROPERTY_RANGE"  # (prop)-[:PROPERTY_RANGE]->(class)
+    REL_INSTANCE_OF = "INSTANCE_OF"  # (obj)-[:INSTANCE_OF]->(class)
+
     def __init__(self, uri: str, user: str, password: str, encrypted: bool = False):
         self._driver: Driver = GraphDatabase.driver(uri, auth=(user, password), encrypted=encrypted)
 
@@ -269,6 +279,524 @@ class Neo4jRepository:
             arc["props"] = props
         return arc
 
+    def get_ontology(self) -> Dict[str, Any]:
+        """
+        Возвращает общую структуру онтологии: все классы с их signature и родительскими отношениями.
+        """
+        q = f"""
+         MATCH (c:{self.CLASS_LABEL})
+         OPTIONAL MATCH (c)-[:{self.REL_SUBCLASS}]->(p:{self.CLASS_LABEL})
+         RETURN c, collect(distinct p.uri) as parents
+         """
+        out = []
+        with self._driver.session() as sess:
+            res = sess.run(q)
+            for r in res:
+                node = self.collect_node(r["c"])
+                node["parents"] = r["parents"]
+                # Добавим signature
+                node["signature"] = self.collect_signature(node.get("uri"))
+                out.append(node)
+        return {"classes": out}
+
+    def get_ontology_parent_classes(self) -> List[TNode]:
+        """
+        Классы, у которых нет родителей (top-level classes).
+        """
+        q = f"""
+         MATCH (c:{self.CLASS_LABEL})
+         WHERE NOT (c)-[:{self.REL_SUBCLASS}]->(:{self.CLASS_LABEL})
+         RETURN c
+         """
+        with self._driver.session() as sess:
+            res = sess.run(q)
+            return [self.collect_node(r["c"]) for r in res]
+
+    def get_class(self, class_uri: str) -> Optional[Dict[str, Any]]:
+        """
+        Получить класс и его signature.
+        """
+        q = f"MATCH (c:{self.CLASS_LABEL} {{uri:$uri}}) RETURN c LIMIT 1"
+        with self._driver.session() as sess:
+            res = sess.run(q, {"uri": class_uri})
+            rec = res.single()
+            if not rec:
+                return None
+            node = self.collect_node(rec["c"])
+            node["signature"] = self.collect_signature(class_uri)
+            return node
+
+    def get_class_parents(self, class_uri: str) -> List[TNode]:
+        q = f"""
+         MATCH (c:{self.CLASS_LABEL} {{uri:$uri}})-[:{self.REL_SUBCLASS}]->(p:{self.CLASS_LABEL})
+         RETURN p
+         """
+        with self._driver.session() as sess:
+            res = sess.run(q, {"uri": class_uri})
+            return [self.collect_node(r["p"]) for r in res]
+
+    def get_class_children(self, class_uri: str) -> List[TNode]:
+        q = f"""
+         MATCH (child:{self.CLASS_LABEL})-[:{self.REL_SUBCLASS}]->(c:{self.CLASS_LABEL} {{uri:$uri}})
+         RETURN child
+         """
+        with self._driver.session() as sess:
+            res = sess.run(q, {"uri": class_uri})
+            return [self.collect_node(r["child"]) for r in res]
+
+    def get_class_objects(self, class_uri: str) -> List[TNode]:
+        """
+        Получить объекты данного класса.
+        Поддерживаем как связи (INSTANCE_OF), так и свойство class_uri на ноде.
+        """
+        q = f"""
+         MATCH (o:{self.OBJECT_LABEL})
+         OPTIONAL MATCH (o)-[:{self.REL_INSTANCE_OF}]->(c:{self.CLASS_LABEL})
+         WHERE (o.{'class_uri'} = $uri) OR (c.uri = $uri)
+         RETURN DISTINCT o
+         """
+        with self._driver.session() as sess:
+            res = sess.run(q, {"uri": class_uri})
+            return [self.collect_node(r["o"]) for r in res]
+
+    def update_class(self, uri: str, title: Optional[str] = None, description: Optional[str] = None) -> Optional[TNode]:
+        """
+        Обновить свойства класса (title, description).
+        """
+        props = {}
+        if title is not None:
+            props["title"] = title
+        if description is not None:
+            props["description"] = description
+        if not props:
+            raise RepositoryError("Nothing to update for class.")
+        q = f"""
+         MATCH (c:{self.CLASS_LABEL} {{uri:$uri}})
+         SET c += $props
+         RETURN c
+         """
+        with self._driver.session() as sess:
+            res = sess.run(q, {"uri": uri, "props": props})
+            rec = res.single()
+            if not rec:
+                return None
+            node = self.collect_node(rec["c"])
+            node["signature"] = self.collect_signature(uri)
+            return node
+
+    def create_class(self, uri: Optional[str] = None, title: Optional[str] = None, description: Optional[str] = None,
+                     parent_uri: Optional[str] = None) -> TNode:
+        """
+        Создать класс. Если parent_uri указан — создаём связь child -[:SUBCLASS_OF]-> parent.
+        """
+        if not uri:
+            uri = self.generate_random_string()
+        props = {"uri": uri}
+        if title is not None:
+            props["title"] = title
+        if description is not None:
+            props["description"] = description
+        q = f"CREATE (c:{self.CLASS_LABEL} $props) RETURN c"
+        with self._driver.session() as sess:
+            res = sess.run(q, {"props": props})
+            rec = res.single()
+            node = self.collect_node(rec["c"])
+            if parent_uri:
+                # создаём связь
+                q_rel = f"""
+                 MATCH (child:{self.CLASS_LABEL} {{uri:$child_uri}}), (parent:{self.CLASS_LABEL} {{uri:$parent_uri}})
+                 CREATE (child)-[:{self.REL_SUBCLASS}]->(parent)
+                 RETURN child, parent
+                 """
+                sess.run(q_rel, {"child_uri": uri, "parent_uri": parent_uri})
+            node["signature"] = self.collect_signature(uri)
+            return node
+
+    def delete_class(self, uri: str) -> bool:
+        """
+        Удалить класс и всех его детей (рекурсивно), объекты и всё связанное.
+        Подход: найти все ноды descendants, где descendant-[:SUBCLASS_OF*]->(class) (т.е. descendant является самим классом или его потомком),
+        и сделать DETACH DELETE для них, а также удалить свойства (DatatypeProperty,ObjectProperty) привязанные только к этим классам.
+        """
+        with self._driver.session() as sess:
+            q_desc = f"""
+             MATCH (c:{self.CLASS_LABEL} {{uri:$uri}})
+             MATCH (d:{self.CLASS_LABEL})
+             WHERE (d)-[:{self.REL_SUBCLASS}*0..]->(c)
+             RETURN collect(distinct d.uri) as uris
+             """
+            res = sess.run(q_desc, {"uri": uri})
+            rec = res.single()
+            if not rec:
+                return False
+            uris = rec["uris"] or []
+            if not uris:
+                return False
+            q_del_objs = f"""
+             MATCH (o:{self.OBJECT_LABEL})
+             WHERE o.class_uri IN $uris
+             DETACH DELETE o
+             """
+            sess.run(q_del_objs, {"uris": uris})
+            q_del_classes = f"""
+             MATCH (d:{self.CLASS_LABEL})
+             WHERE d.uri IN $uris
+             DETACH DELETE d
+             """
+            sess.run(q_del_classes, {"uris": uris})
+            q_cleanup_props = f"""
+             MATCH (p)
+             WHERE (p:{self.DATATYPE_PROPERTY_LABEL} OR p:{self.OBJECT_PROPERTY_LABEL})
+             AND NOT ( (p)-[:{self.REL_PROPERTY_DOMAIN}|:{self.REL_PROPERTY_RANGE}]-() )
+             DETACH DELETE p
+             """
+            sess.run(q_cleanup_props)
+            return True
+
+    def add_class_attribute(self, class_uri: str, prop_uri: Optional[str] = None, title: Optional[str] = None) -> Dict[
+        str, Any]:
+        """
+        Добавить DatatypeProperty к классу: создаёт (p:DatatypeProperty)-[:PROPERTY_DOMAIN]->(class)
+        Если prop_uri не указан — генерируем.
+        Возвращает созданный property node dict.
+        """
+        if not prop_uri:
+            prop_uri = self.generate_random_string()
+        props = {"uri": prop_uri}
+        if title:
+            props["title"] = title
+        q = f"""
+         MATCH (c:{self.CLASS_LABEL} {{uri:$class_uri}})
+         CREATE (p:{self.DATATYPE_PROPERTY_LABEL} $props)
+         CREATE (p)-[:{self.REL_PROPERTY_DOMAIN}]->(c)
+         RETURN p
+         """
+        with self._driver.session() as sess:
+            res = sess.run(q, {"class_uri": class_uri, "props": props})
+            rec = res.single()
+            if not rec:
+                raise RepositoryError("Class not found or property creation failed.")
+            return self.collect_node(rec["p"])
+
+    def delete_class_attribute(self, prop_uri: str) -> bool:
+        """
+        Удалить DatatypeProperty (по uri). Удаляет ноду свойства и все связи.
+        """
+        q = f"""
+         MATCH (p:{self.DATATYPE_PROPERTY_LABEL} {{uri:$uri}})
+         DETACH DELETE p
+         RETURN COUNT(p) as cnt
+         """
+        with self._driver.session() as sess:
+            res = sess.run(q, {"uri": prop_uri})
+            rec = res.single()
+            return bool(rec and rec["cnt"] and rec["cnt"] > 0)
+
+    def add_class_object_attribute(self, class_uri: str, attr_uri: Optional[str] = None,
+                                   attr_title: Optional[str] = None, range_class_uri: Optional[str] = None) -> Dict[
+        str, Any]:
+        """
+        Добавить ObjectProperty: создаёт ноду ObjectProperty и связывает domain -> class и range -> range_class (если указан).
+        Возвращает созданную ноду property.
+        """
+        if not attr_uri:
+            attr_uri = self.generate_random_string()
+        props = {"uri": attr_uri}
+        if attr_title:
+            props["title"] = attr_title
+        q = f"""
+         MATCH (c:{self.CLASS_LABEL} {{uri:$class_uri}})
+         CREATE (p:{self.OBJECT_PROPERTY_LABEL} $props)
+         CREATE (p)-[:{self.REL_PROPERTY_DOMAIN}]->(c)
+         RETURN p
+         """
+        with self._driver.session() as sess:
+            res = sess.run(q, {"class_uri": class_uri, "props": props})
+            rec = res.single()
+            if not rec:
+                raise RepositoryError("Class not found or object property creation failed.")
+            created = self.collect_node(rec["p"])
+            if range_class_uri:
+                q_range = f"""
+                 MATCH (p:{self.OBJECT_PROPERTY_LABEL} {{uri:$p_uri}}), (r:{self.CLASS_LABEL} {{uri:$range_uri}})
+                 CREATE (p)-[:{self.REL_PROPERTY_RANGE}]->(r)
+                 """
+                sess.run(q_range, {"p_uri": attr_uri, "range_uri": range_class_uri})
+            return created
+
+    def delete_class_object_attribute(self, object_property_uri: str) -> bool:
+        """
+        Удаление ObjectProperty: удаляем реальные рёбра между объектами, которые имели тип свойства,
+        затем удаляем ноду свойства.
+        """
+        rel_type_label = _safe_label(object_property_uri)
+        with self._driver.session() as sess:
+            q_del_rels = f"""
+             MATCH ()-[r]-()
+             WHERE type(r) = $rel_type
+             DELETE r
+             """
+            sess.run(q_del_rels, {"rel_type": rel_type_label})
+            q_del_node = f"""
+             MATCH (p:{self.OBJECT_PROPERTY_LABEL} {{uri:$uri}})
+             DETACH DELETE p
+             RETURN COUNT(p) as cnt
+             """
+            res = sess.run(q_del_node, {"uri": object_property_uri})
+            rec = res.single()
+            return bool(rec and rec["cnt"] and rec["cnt"] > 0)
+
+    def add_class_parent(self, parent_uri: str, target_uri: str) -> bool:
+        """
+        Присоединить родителя к существующему классу: создаёт (child)-[:SUBCLASS_OF]->(parent)
+        target_uri = uri класса-ребёнка, parent_uri = uri родителя
+        """
+        q = f"""
+         MATCH (child:{self.CLASS_LABEL} {{uri:$child_uri}}), (parent:{self.CLASS_LABEL} {{uri:$parent_uri}})
+         MERGE (child)-[:{self.REL_SUBCLASS}]->(parent)
+         RETURN child, parent
+         """
+        with self._driver.session() as sess:
+            res = sess.run(q, {"child_uri": target_uri, "parent_uri": parent_uri})
+            rec = res.single()
+            return bool(rec)
+
+    def get_object(self, obj_uri: str) -> Optional[TNode]:
+        q = f"""
+         MATCH (o:{self.OBJECT_LABEL} {{uri:$uri}})
+         OPTIONAL MATCH (o)-[:{self.REL_INSTANCE_OF}]->(c:{self.CLASS_LABEL})
+         RETURN o, c
+         LIMIT 1
+         """
+        with self._driver.session() as sess:
+            res = sess.run(q, {"uri": obj_uri})
+            rec = res.single()
+            if not rec:
+                return None
+            node = self.collect_node(rec["o"])
+            if rec.get("c"):
+                node["class"] = self.collect_node(rec["c"])
+            return node
+
+    def delete_object(self, obj_uri: str) -> bool:
+        q = f"""
+         MATCH (o:{self.OBJECT_LABEL} {{uri:$uri}})
+         DETACH DELETE o
+         RETURN COUNT(o) as cnt
+         """
+        with self._driver.session() as sess:
+            res = sess.run(q, {"uri": obj_uri})
+            rec = res.single()
+            return bool(rec and rec["cnt"] and rec["cnt"] > 0)
+
+    def create_object(self, class_uri: str, obj_uri: Optional[str] = None, title: Optional[str] = None,
+                      description: Optional[str] = None, datatype_props: Optional[Dict[str, Any]] = None,
+                      object_relations: Optional[List[Dict[str, Any]]] = None) -> TNode:
+        """
+        Создать объект заданного класса.
+        datatype_props: map { field_name: value } - применяются как свойства ноды
+        object_relations: список dict с полями:
+            { "prop_uri": "...", "target_uri": "...", "direction": 1|-1 }
+        where direction == 1 => (this_obj)-[:PROP]->(target)
+              direction == -1 => (target)-[:PROP]->(this_obj)
+        """
+        if not obj_uri:
+            obj_uri = self.generate_random_string()
+        props = {"uri": obj_uri, "class_uri": class_uri}
+        if title:
+            props["title"] = title
+        if description:
+            props["description"] = description
+        if datatype_props:
+            for k, v in datatype_props.items():
+                props[k] = v
+        q = f"CREATE (o:{self.OBJECT_LABEL} $props) RETURN o"
+        with self._driver.session() as sess:
+            res = sess.run(q, {"props": props})
+            rec = res.single()
+            if not rec:
+                raise RepositoryError("Object creation failed.")
+            created = self.collect_node(rec["o"])
+            if object_relations:
+                for rel in object_relations:
+                    prop_uri = rel.get("prop_uri")
+                    target_uri = rel.get("target_uri")
+                    direction = rel.get("direction", 1)
+                    if not prop_uri or not target_uri:
+                        continue
+                    rel_label = _safe_label(prop_uri)
+                    if direction == 1:
+                        q_rel = f"""
+                         MATCH (a:{self.OBJECT_LABEL} {{uri:$a_uri}}), (b:{self.OBJECT_LABEL} {{uri:$b_uri}})
+                         CREATE (a)-[r:{rel_label}]->(b)
+                         RETURN r
+                         """
+                        sess.run(q_rel, {"a_uri": obj_uri, "b_uri": target_uri})
+                    else:
+                        q_rel = f"""
+                         MATCH (a:{self.OBJECT_LABEL} {{uri:$a_uri}}), (b:{self.OBJECT_LABEL} {{uri:$b_uri}})
+                         CREATE (b)-[r:{rel_label}]->(a)
+                         RETURN r
+                         """
+                        sess.run(q_rel, {"a_uri": obj_uri, "b_uri": target_uri})
+            return created
+
+    def update_object(self, obj_uri: str, title: Optional[str] = None, description: Optional[str] = None,
+                      datatype_props: Optional[Dict[str, Any]] = None,
+                      object_relations_to_add: Optional[List[Dict[str, Any]]] = None,
+                      object_relations_to_remove: Optional[List[Dict[str, Any]]] = None) -> Optional[TNode]:
+        """
+        Обновить объект: менять свойства (datatype_props), title/description, добавлять/удалять object relations.
+        object_relations_... формат как в create_object.
+        """
+        set_parts = {}
+        if title is not None:
+            set_parts["title"] = title
+        if description is not None:
+            set_parts["description"] = description
+        if datatype_props:
+            for k, v in datatype_props.items():
+                set_parts[k] = v
+        if not set_parts and not object_relations_to_add and not object_relations_to_remove:
+            raise RepositoryError("Nothing to update for object.")
+        params = {"uri": obj_uri}
+        with self._driver.session() as sess:
+            if set_parts:
+                q = f"""
+                 MATCH (o:{self.OBJECT_LABEL} {{uri:$uri}})
+                 SET o += $props
+                 RETURN o
+                 """
+                res = sess.run(q, {"uri": obj_uri, "props": set_parts})
+                rec = res.single()
+            else:
+                q = f"MATCH (o:{self.OBJECT_LABEL} {{uri:$uri}}) RETURN o"
+                res = sess.run(q, {"uri": obj_uri})
+                rec = res.single()
+            if not rec:
+                return None
+            node = self.collect_node(rec["o"])
+            if object_relations_to_remove:
+                for rel in object_relations_to_remove:
+                    prop_uri = rel.get("prop_uri")
+                    target_uri = rel.get("target_uri")
+                    direction = rel.get("direction", 1)
+                    if not prop_uri or not target_uri:
+                        continue
+                    rel_label = _safe_label(prop_uri)
+                    if direction == 1:
+                        q_del = f"""
+                         MATCH (a:{self.OBJECT_LABEL} {{uri:$a_uri}})-[r:{rel_label}]->(b:{self.OBJECT_LABEL} {{uri:$b_uri}})
+                         DELETE r
+                         """
+                        sess.run(q_del, {"a_uri": obj_uri, "b_uri": target_uri})
+                    else:
+                        q_del = f"""
+                         MATCH (b:{self.OBJECT_LABEL} {{uri:$b_uri}})-[r:{rel_label}]->(a:{self.OBJECT_LABEL} {{uri:$a_uri}})
+                         DELETE r
+                         """
+                        sess.run(q_del, {"a_uri": obj_uri, "b_uri": target_uri})
+            if object_relations_to_add:
+                for rel in object_relations_to_add:
+                    prop_uri = rel.get("prop_uri")
+                    target_uri = rel.get("target_uri")
+                    direction = rel.get("direction", 1)
+                    if not prop_uri or not target_uri:
+                        continue
+                    rel_label = _safe_label(prop_uri)
+                    if direction == 1:
+                        q_add = f"""
+                         MATCH (a:{self.OBJECT_LABEL} {{uri:$a_uri}}), (b:{self.OBJECT_LABEL} {{uri:$b_uri}})
+                         MERGE (a)-[r:{rel_label}]->(b)
+                         RETURN r
+                         """
+                        sess.run(q_add, {"a_uri": obj_uri, "b_uri": target_uri})
+                    else:
+                        q_add = f"""
+                         MATCH (a:{self.OBJECT_LABEL} {{uri:$a_uri}}), (b:{self.OBJECT_LABEL} {{uri:$b_uri}})
+                         MERGE (b)-[r:{rel_label}]->(a)
+                         RETURN r
+                         """
+                        sess.run(q_add, {"a_uri": obj_uri, "b_uri": target_uri})
+            return self.get_object(obj_uri)
+
+    def collect_signature(self, class_uri: str) -> Dict[str, Any]:
+        """
+        Собрать signature для класса: datatype properties (params) и object properties (obj_params).
+        Отбираем свойства, которые:
+         - напрямую имеют domain == класс (p)-[:PROPERTY_DOMAIN]->(class)
+         - либо привязаны к классам, которые находятся по цепочке наследования (descendants OR ancestors в
+         зависимости от вашей онтологии)
+        Для простоты: используем поиск свойств, у которых (p)-[:PROPERTY_DOMAIN]->(some_class),
+        и some_class является либо самим классом, либо классом, связанным SUBCLASS_OF* с ним (в обе стороны).
+        """
+        params = []
+        obj_params = []
+
+        with self._driver.session() as sess:
+            # DatatypeProperties: найдём все p, где p-[:PROPERTY_DOMAIN]->(s)
+            q_dt = f"""
+             MATCH (s:{self.CLASS_LABEL} {{uri:$uri}})
+             MATCH (p:{self.DATATYPE_PROPERTY_LABEL})-[:{self.REL_PROPERTY_DOMAIN}]->(s)
+             RETURN DISTINCT p
+             """
+            res_dt = sess.run(q_dt, {"uri": class_uri})
+            for r in res_dt:
+                p = self.collect_node(r["p"])
+                params.append({"title": p.get("title"), "url": p.get("uri")})
+            # domain from classes that are subclass of s (их свойства наследуются вверх?) — включим поля от подклассов тоже
+            q_dt_inherited = f"""
+             MATCH (s:{self.CLASS_LABEL} {{uri:$uri}})
+             MATCH (x:{self.CLASS_LABEL})-[:{self.REL_SUBCLASS}*]->(s)
+             MATCH (p:{self.DATATYPE_PROPERTY_LABEL})-[:{self.REL_PROPERTY_DOMAIN}]->(x)
+             RETURN DISTINCT p
+             """
+            res_dt2 = sess.run(q_dt_inherited, {"uri": class_uri})
+            for r in res_dt2:
+                p = self.collect_node(r["p"])
+                entry = {"title": p.get("title"), "url": p.get("uri")}
+                if entry not in params:
+                    params.append(entry)
+
+            # ObjectProperties  direction 1 (from this class to target range), -1 (from external class to this class)
+            # direction == 1: (p)-[:PROPERTY_DOMAIN]->(this_class) and (p)-[:PROPERTY_RANGE]->(rclass)
+            q_obj_forward = f"""
+             MATCH (s:{self.CLASS_LABEL} {{uri:$uri}})
+             MATCH (p:{self.OBJECT_PROPERTY_LABEL})-[:{self.REL_PROPERTY_DOMAIN}]->(s)
+             OPTIONAL MATCH (p)-[:{self.REL_PROPERTY_RANGE}]->(r:{self.CLASS_LABEL})
+             RETURN DISTINCT p, r
+             """
+            res_obj_f = sess.run(q_obj_forward, {"uri": class_uri})
+            for r in res_obj_f:
+                p = self.collect_node(r["p"])
+                rcls = self.collect_node(r["r"]) if r.get("r") else None
+                obj_params.append({
+                    "title": p.get("title"),
+                    "url": p.get("uri"),
+                    "target_class_url": rcls.get("uri") if rcls else None,
+                    "relation_direction": 1
+                })
+
+            #  direction == -1: (p)-[:PROPERTY_RANGE]->(this_class) and (p)-[:PROPERTY_DOMAIN]->(other_class)
+            q_obj_backward = f"""
+             MATCH (s:{self.CLASS_LABEL} {{uri:$uri}})
+             MATCH (p:{self.OBJECT_PROPERTY_LABEL})-[:{self.REL_PROPERTY_RANGE}]->(s)
+             OPTIONAL MATCH (p)-[:{self.REL_PROPERTY_DOMAIN}]->(r:{self.CLASS_LABEL})
+             RETURN DISTINCT p, r
+             """
+            res_obj_b = sess.run(q_obj_backward, {"uri": class_uri})
+            for r in res_obj_b:
+                p = self.collect_node(r["p"])
+                rcls = self.collect_node(r["r"]) if r.get("r") else None
+                obj_params.append({
+                    "title": p.get("title"),
+                    "url": p.get("uri"),
+                    "target_class_url": rcls.get("uri") if rcls else None,
+                    "relation_direction": -1
+                })
+
+        return {"params": params, "obj_params": obj_params}
+
     def _convert_value(self, v):
         # Convert neo4j types to python simple types if needed
         # e.g., DateTime, Node, Relationship etc. For simplicity, we convert
@@ -334,5 +862,55 @@ if __name__ == "__main__":
             repo.delete_arc_by_element_id(arc["id"])
         repo.delete_node_by_uri("node-a-001")
         repo.delete_node_by_uri("node-b-001")
+        print("\n=== Ontology Test (Class / Properties) ===")
+
+        # Create two classes
+        cls_person = repo.create_node(
+            {"title": "Person", "description": "Human being", "uri": "class-person-001"},
+            labels=["Class"]
+        )
+        cls_book = repo.create_node(
+            {"title": "Book", "description": "A written work", "uri": "class-book-001"},
+            labels=["Class"]
+        )
+        print("Created classes:")
+        print("Person:", cls_person)
+        print("Book:", cls_book)
+
+        # Add parent relationship (Book inherits from Person, for example)
+        repo.create_arc("class-book-001", "class-person-001", rel_type="PARENT")
+
+        # Create DatatypeProperty for Person (e.g., "age")
+        dt_age = repo.create_node(
+            {"title": "age", "description": "Person's age", "uri": "prop-age-001"},
+            labels=["DatatypeProperty"]
+        )
+        repo.create_arc("class-person-001", "prop-age-001", rel_type="HAS_DATATYPE")
+
+        # Create ObjectProperty (Person -> Book)
+        op_writes = repo.create_node(
+            {"title": "writes", "description": "Person writes Book", "uri": "prop-writes-001"},
+            labels=["ObjectProperty"]
+        )
+        repo.create_arc("class-person-001", "prop-writes-001", rel_type="HAS_PROPERTY")
+        repo.create_arc("prop-writes-001", "class-book-001", rel_type="RANGE")
+
+        # View full ontology
+        ontology = repo.get_all_nodes_and_arcs()
+        print("\nOntology (nodes + arcs):")
+        print(json.dumps(ontology, indent=2, ensure_ascii=False))
+
+        # Update class Person
+        updated_cls = repo.update_node("class-person-001", {"description": "Updated Person description"})
+        print("\nUpdated Person class:")
+        print(updated_cls)
+
+        # Cleanup
+        print("\nCleaning up ontology...")
+        repo.delete_node_by_uri("class-person-001")
+        repo.delete_node_by_uri("class-book-001")
+        repo.delete_node_by_uri("prop-age-001")
+        repo.delete_node_by_uri("prop-writes-001")
+
     finally:
         repo.close()
