@@ -1,5 +1,5 @@
 import re
-from typing import Dict, Any
+from typing import Dict, Any, TypedDict, Optional, List
 
 from utils.repository_error import RepositoryError
 
@@ -18,5 +18,16 @@ def _safe_property_key(key: str) -> str:
     return f"`{key}`"
 
 
-TNode = Dict[str, Any]
-TArc = Dict[str, Any]
+TNode = TypedDict('TNode', {
+    'id': str,
+    'uri': Optional[str],
+    'description': Optional[str],
+    'title': Optional[str],
+    'arcs': Optional[List['TArc']],
+})
+TArc = TypedDict('TArc', {
+    'id': str,
+    'uri': Optional[str],
+    'node_uri_from': Optional[str],
+    'node_uri_to': Optional[str],
+})

@@ -10,10 +10,8 @@ from utils.repository_error import RepositoryError
 
 
 class Neo4jRepository:
-    def __init__(self, uri: str, user: str, password: str, encrypted: bool = False,
-                 base_uri: str = "http://localhost:7474/db/data/node/"):
+    def __init__(self, uri: str, user: str, password: str, encrypted: bool = False):
         self._driver: Driver = GraphDatabase.driver(uri, auth=(user, password), encrypted=encrypted)
-        self.base_uri = base_uri.rstrip("/") + "/"
 
     def close(self):
         self._driver.close()
@@ -111,9 +109,7 @@ class Neo4jRepository:
         Returns created node dict.
         """
         if "uri" not in params:
-            params["uri"] = self.base_uri + self.generate_random_string()
-        elif not params["uri"].startswith("http"):
-            params["uri"] = self.base_uri + params["uri"]
+            params["uri"] = self.generate_random_string()
         label_part = ''
         if labels:
             label_part = ':' + self.transform_labels(labels, separator=':')
@@ -131,10 +127,6 @@ class Neo4jRepository:
         rel_type will be validated (only letters/numbers/_ allowed).
         Returns created arc dict.
         """
-        if not node1_uri.startswith("http"):
-            node1_uri = self.base_uri + node1_uri
-        if not node2_uri.startswith("http"):
-            node2_uri = self.base_uri + node2_uri
         rel_type_safe = rel_type if _LABEL_RE.match(rel_type) else "RELATED"
         props = props or {}
         rel_type_cy = _safe_label(rel_type_safe)
@@ -217,19 +209,12 @@ class Neo4jRepository:
                 out.append(rec)
             return out
 
-
     def collect_node(self, node_obj) -> TNode:
-        """
-        Возвращает TNode с единственным идентификатором `id` = element_id (строка).
-        Убираем legacy numeric id.
-        """
         try:
             eid = node_obj.element_id
         except Exception:
             eid = None
         data = {"id": eid}
-
-
         try:
             for k in node_obj.keys():
                 data[k] = self._convert_value(node_obj[k])
@@ -239,7 +224,6 @@ class Neo4jRepository:
                     data[k] = self._convert_value(v)
             except Exception:
                 pass
-
         data.setdefault("uri", data.get("uri", None))
         data.setdefault("title", data.get("title", None))
         data.setdefault("description", data.get("description", None))
@@ -247,8 +231,8 @@ class Neo4jRepository:
 
     def collect_arc(self, rel_obj, target_node=None) -> TArc:
         """
-        Transforms a neo4j.types.graph.Relationship into TArc dict.
-        If target_node provided, attempt to read its uri for node_uri_to.
+            Transforms a neo4j.types.graph.Relationship into TArc dict.
+            If target_node provided, attempt to read its uri for node_uri_to.
         """
         try:
             eid = rel_obj.element_id
