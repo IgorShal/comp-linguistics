@@ -817,5 +817,37 @@ if __name__ == "__main__":
         print("get_node_by_uri dp-age:", repo.get_node_by_uri("dp-age"))
         print("get_node_by_uri op-to-b:", repo.get_node_by_uri("op-to-b"))
 
+        print("\nTest: create_node with existing uri (should update, not duplicate)")
+        node_a1 = repo.create_node({"uri": "node-a-001", "title": "Node A v2", "description": "Updated again"},
+                                   labels=["TestLabel"])
+        print("Node A (recreated):", node_a1)
+        nodes_a = repo.get_node_by_uri("node-a-001")
+        print("All Node A with same uri:", nodes_a)
+
+        print("\nTest: create_arc with missing node (should raise RepositoryError)")
+        try:
+            repo.create_arc("node-a-001", "non-existent-uri", "BROKEN")
+        except RepositoryError as e:
+            print("Expected error:", e)
+
+        print("\nTest: delete_class_attribute")
+        deleted = repo.delete_class_attribute("dp-age")
+        print("Datatype property dp-age deleted:", deleted)
+
+        print("\nTest: delete_class_object_attribute")
+        deleted_objprop = repo.delete_class_object_attribute("op_to_b")
+        print("Object property op-to-b deleted:", deleted_objprop)
+
+        print("\nTest: get_objects_of_class after class deletion")
+        objs_A = repo.get_class_objects("class-A")
+        print("Objects of class-A after deletion:", objs_A)
+
+        print("\nTest: run custom query (list all uris)")
+        q = "MATCH (n) RETURN n.uri as uri LIMIT 10"
+        res = repo.run_custom_query(q)
+        print("Sample uris:", res)
+
+        repo.close()
+
     finally:
         repo.close()
