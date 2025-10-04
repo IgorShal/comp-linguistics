@@ -1,4 +1,3 @@
-
 import json
 import uuid
 from typing import List, Dict, Any, Optional
@@ -18,7 +17,7 @@ class Neo4jRepository:
     REL_SUBCLASS = "SUBCLASS_OF"  # child -[:SUBCLASS_OF]-> parent
     REL_PROPERTY_DOMAIN = "PROPERTY_DOMAIN"  # (prop)-[:PROPERTY_DOMAIN]->(class)
     REL_PROPERTY_RANGE = "PROPERTY_RANGE"  # (prop)-[:PROPERTY_RANGE]->(class)
-    REL_INSTANCE_OF = "INSTANCE_OF"  # (obj)-[:INSTANCE_OF]->(class)
+    REL_INSTANCE_OF = "TYPE"  # (obj)-[:TYPE]->(class)
 
     def __init__(self, uri: str, user: str, password: str, encrypted: bool = False):
         self._driver: Driver = GraphDatabase.driver(uri, auth=(user, password), encrypted=encrypted)
@@ -52,6 +51,78 @@ class Neo4jRepository:
             return "", {}
         return "{props_map}", {"props_map": props}
 
+    # ------------------ Helper lookups ------------------
+    def _find_node_uri_by_title(self, label: Optional[str], title: str) -> Optional[str]:
+        """Find first node.uri by label and title. If label is None matches any label with property title."""
+        label_cy = f":{_safe_label(label)}" if label else ""
+        q = f"MATCH (n{label_cy} {{title:$title}}) RETURN n.uri as uri LIMIT 1"
+        with self._driver.session() as sess:
+            rec = sess.run(q, {"title": title}).single()
+            if not rec:
+                return None
+            return rec.get("uri")
+
+    def _find_node_by_title(self, label: Optional[str], title: str) -> Optional[TNode]:
+        uri = self._find_node_uri_by_title(label, title)
+        if not uri:
+            return None
+        return self.get_node_by_uri(uri)
+
+    # ------------------ Basic node operations (uris are always generated) ------------------
+    def create_node(self, params: Dict[str, Any], labels: Optional[List[str]] = None) -> TNode:
+        """
+        Always creates a fresh node with a generated `uri` (user-provided uri is ignored).
+        `params` may include title/description and any other props.
+        """
+        props = dict(params or {})
+        props.pop("uri", None)  # ignore provided uri
+        props["uri"] = self.generate_random_string()
+        labels_cy = ":" + self.transform_labels(labels, separator=':') if labels else ""
+        q = f"CREATE (n{labels_cy} $props) RETURN n"
+        with self._driver.session() as sess:
+            res = sess.run(q, {"props": props})
+            rec = res.single()
+            if not rec:
+                raise RepositoryError("Node creation failed.")
+            return self.collect_node(rec["n"])
+
+    def create_arc(self, node1_uri: str, node2_uri: str, rel_type: str = "RELATED",
+                   props: Optional[Dict[str, Any]] = None) -> TArc:
+        """
+        Create directed arc (node1)-[r:RELTYPE {props}]->(node2).
+        rel_type will be validated (only letters/numbers/_ allowed).
+        Returns created arc dict.
+        """
+        rel_type_safe = rel_type if _LABEL_RE.match(rel_type) else "RELATED"
+        props = props or {}
+        rel_type_cy = _safe_label(rel_type_safe)
+        q = f"""
+           MATCH (a {{uri: $uri1}}), (b {{uri: $uri2}})
+           CREATE (a)-[r:{rel_type_cy} $props]->(b)
+           RETURN r, a, b
+           """
+        with self._driver.session() as sess:
+            res = sess.run(q, {"uri1": node1_uri, "uri2": node2_uri, "props": props})
+            rec = res.single()
+            if not rec:
+                raise RepositoryError("One of nodes not found, arc not created.")
+            r = rec["r"]
+            b = rec["b"]
+            return self.collect_arc(r, target_node=b)
+
+    def create_arc_by_titles(self, node1_title: str, node2_title: str, rel_type: str = "RELATED",
+                             label1: Optional[str] = None, label2: Optional[str] = None,
+                             props: Optional[Dict[str, Any]] = None) -> TArc:
+        """
+        Convenience: find nodes by title (optionally restrict by label) and create arc between them.
+        Titles must be unique or first match will be used.
+        """
+        uri1 = self._find_node_uri_by_title(label1, node1_title)
+        uri2 = self._find_node_uri_by_title(label2, node2_title)
+        if not uri1 or not uri2:
+            raise RepositoryError("One of nodes not found by title, arc not created.")
+        return self.create_arc(uri1, uri2, rel_type=rel_type, props=props)
+
     def get_all_nodes(self) -> List[TNode]:
         q = "MATCH (n) RETURN n"
         with self._driver.session() as sess:
@@ -63,10 +134,6 @@ class Neo4jRepository:
             return nodes
 
     def get_all_nodes_and_arcs(self) -> List[TNode]:
-        """
-        Returns list of nodes, each node dict may include 'arcs': list of arcs outgoing from this node.
-        Using DISTINCT to avoid duplicates in aggregation.
-        """
         q = f"""
           MATCH (n)
           OPTIONAL MATCH (n)-[r]->(m)
@@ -94,9 +161,6 @@ class Neo4jRepository:
             return out
 
     def get_nodes_by_labels(self, labels: List[str]) -> List[TNode]:
-        """
-        labels: list of label names (strings).
-        """
         labels_cy = self.transform_labels(labels, separator=':')
         if labels_cy == '':
             raise RepositoryError("labels list empty")
@@ -114,53 +178,11 @@ class Neo4jRepository:
                 return None
             return self.collect_node(rec["n"])
 
-    def create_node(self, params: Dict[str, Any], labels: Optional[List[str]] = None) -> TNode:
-        if "uri" not in params:
-            params["uri"] = self.generate_random_string()
-        labels_cy = ""
-        if labels:
-            labels_cy = ":" + self.transform_labels(labels, separator=':')
-        q = f"""
-        MERGE (n {{uri: $uri}})
-        SET n += $props
-        {"SET n" + labels_cy if labels_cy else ""}
-        RETURN n
-        """
-        with self._driver.session() as sess:
-            res = sess.run(q, {"uri": params["uri"], "props": params})
-            rec = res.single()
-            if not rec:
-                raise RepositoryError("Node creation failed.")
-            return self.collect_node(rec["n"])
+    def get_node_by_title(self, label: Optional[str], title: str) -> Optional[TNode]:
+        return self._find_node_by_title(label, title)
 
-    def create_arc(self, node1_uri: str, node2_uri: str, rel_type: str = "RELATED", props: Optional[Dict[str, Any]] = None) -> TArc:
-        """
-        Create directed arc (node1)-[r:RELTYPE {props}]->(node2).
-        rel_type will be validated (only letters/numbers/_ allowed).
-        Returns created arc dict.
-        """
-        rel_type_safe = rel_type if _LABEL_RE.match(rel_type) else "RELATED"
-        props = props or {}
-        rel_type_cy = _safe_label(rel_type_safe)
-        q = f"""
-        MATCH (a {{uri: $uri1}}), (b {{uri: $uri2}})
-        CREATE (a)-[r:{rel_type_cy} $props]->(b)
-        RETURN r, a, b
-        """
-        with self._driver.session() as sess:
-            res = sess.run(q, {"uri1": node1_uri, "uri2": node2_uri, "props": props})
-            rec = res.single()
-            if not rec:
-                raise RepositoryError("One of nodes not found, arc not created.")
-            r = rec["r"]
-            b = rec["b"]
-            return self.collect_arc(r, target_node=b)
-
+    # ------------------ Delete / Update (unchanged behaviour expects uri) ------------------
     def delete_node_by_uri(self, uri: str, detach: bool = True) -> bool:
-        """
-        delete node by uri. If detach True then detach delete (removes relationships too).
-        Returns True if something was deleted.
-        """
         if detach:
             q = "MATCH (n {uri:$uri}) DETACH DELETE n RETURN COUNT(n) as cnt"
         else:
@@ -177,12 +199,8 @@ class Neo4jRepository:
             rec = res.single()
             return bool(rec and rec["cnt"] and rec["cnt"] > 0)
 
-    def update_node(self, uri: str, props: Dict[str, Any], set_labels: Optional[List[str]] = None, remove_labels: Optional[List[str]] = None) -> Optional[TNode]:
-        """
-        Update node properties using map merge (n += $props).
-        Optionally add/remove labels.
-        Returns updated node or None.
-        """
+    def update_node(self, uri: str, props: Dict[str, Any], set_labels: Optional[List[str]] = None,
+                    remove_labels: Optional[List[str]] = None) -> Optional[TNode]:
         if not props and not set_labels and not remove_labels:
             raise RepositoryError("Nothing to update provided.")
         queries = []
@@ -205,82 +223,7 @@ class Neo4jRepository:
                 return None
             return self.collect_node(rec["n"])
 
-    def run_custom_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """
-        Execute arbitrary Cypher. Returns list of records converted to dicts.
-        WARNING: user is responsible for safety of query.
-        """
-        params = params or {}
-        with self._driver.session() as sess:
-            res = sess.run(query, params)
-            out = []
-            for r in res:
-                rec = {}
-                for k in r.keys():
-                    rec[k] = self._convert_value(r[k])
-                out.append(rec)
-            return out
-
-    def collect_node(self, node_obj) -> TNode:
-        try:
-            eid = node_obj.element_id
-        except Exception:
-            eid = None
-        data = {"id": eid}
-        try:
-            for k in node_obj.keys():
-                data[k] = self._convert_value(node_obj[k])
-        except Exception:
-            try:
-                for k, v in dict(node_obj).items():
-                    data[k] = self._convert_value(v)
-            except Exception:
-                pass
-        data.setdefault("uri", data.get("uri", None))
-        data.setdefault("title", data.get("title", None))
-        data.setdefault("description", data.get("description", None))
-        return data
-
-    def collect_arc(self, rel_obj, target_node=None) -> TArc:
-        """
-            Transforms a neo4j.types.graph.Relationship into TArc dict.
-            If target_node provided, attempt to read its uri for node_uri_to.
-        """
-        try:
-            eid = rel_obj.element_id
-        except Exception:
-            eid = None
-
-        rel_type = getattr(rel_obj, "type", None) or type(rel_obj).__name__
-
-        props = {}
-        try:
-            for k in rel_obj.keys():
-                props[k] = self._convert_value(rel_obj[k])
-        except Exception:
-            pass
-
-        node_from_uri = None
-        node_to_uri = None
-        try:
-            sn = rel_obj.start_node
-            en = rel_obj.end_node
-            node_from_uri = sn.get("uri", None)
-            node_to_uri = en.get("uri", None)
-        except Exception:
-            if target_node is not None:
-                node_to_uri = target_node.get("uri", None)
-
-        arc = {
-            "id": eid,
-            "uri": rel_type,
-            "node_uri_from": node_from_uri,
-            "node_uri_to": node_to_uri,
-        }
-        if props:
-            arc["props"] = props
-        return arc
-
+    # ------------------ Ontology helpers ------------------
     def get_ontology(self) -> Dict[str, Any]:
         q = f"""
          MATCH (c:{self.CLASS_LABEL})
@@ -293,7 +236,6 @@ class Neo4jRepository:
             for r in res:
                 node = self.collect_node(r["c"])
                 node["parents"] = r["parents"]
-                # Добавим signature
                 node["signature"] = self.collect_signature(node.get("uri"))
                 out.append(node)
         return {"classes": out}
@@ -308,6 +250,30 @@ class Neo4jRepository:
             res = sess.run(q)
             return [self.collect_node(r["c"]) for r in res]
 
+    # ------------------ Class CRUD (uri always generated on create) ------------------
+    def create_class(self, title: str, description: Optional[str] = None, parent_title: Optional[str] = None) -> TNode:
+        """
+        Create a new class. The node `uri` is always generated internally (user cannot pass uri).
+        To attach to a parent, pass parent_title (the existing parent's title). Titles should be unique.
+        """
+        props = {"uri": self.generate_random_string(), "title": title}
+        if description is not None:
+            props["description"] = description
+        q = f"CREATE (c:{self.CLASS_LABEL} $props) RETURN c"
+        with self._driver.session() as sess:
+            res = sess.run(q, {"props": props})
+            rec = res.single()
+            node = self.collect_node(rec["c"])
+            if parent_title:
+                parent_uri = self._find_node_uri_by_title(self.CLASS_LABEL, parent_title)
+                if not parent_uri:
+                    raise RepositoryError("Parent class with provided title not found.")
+                # create subclass relation
+                q_rel = f"MATCH (child:{self.CLASS_LABEL} {{uri:$child_uri}}), (parent:{self.CLASS_LABEL} {{uri:$parent_uri}}) CREATE (child)-[:{self.REL_SUBCLASS}]->(parent)"
+                sess.run(q_rel, {"child_uri": node["uri"], "parent_uri": parent_uri})
+            node["signature"] = self.collect_signature(node["uri"])
+            return node
+
     def get_class(self, class_uri: str) -> Optional[Dict[str, Any]]:
         q = f"MATCH (c:{self.CLASS_LABEL} {{uri:$uri}}) RETURN c LIMIT 1"
         with self._driver.session() as sess:
@@ -318,6 +284,13 @@ class Neo4jRepository:
             node = self.collect_node(rec["c"])
             node["signature"] = self.collect_signature(class_uri)
             return node
+
+    def get_class_by_title(self, title: str) -> Optional[Dict[str, Any]]:
+        node = self._find_node_by_title(self.CLASS_LABEL, title)
+        if not node:
+            return None
+        node["signature"] = self.collect_signature(node["uri"])
+        return node
 
     def get_class_parents(self, class_uri: str) -> List[TNode]:
         q = f"""
@@ -370,32 +343,8 @@ class Neo4jRepository:
             node["signature"] = self.collect_signature(uri)
             return node
 
-    def create_class(self, uri: Optional[str] = None, title: Optional[str] = None, description: Optional[str] = None,
-                     parent_uri: Optional[str] = None) -> TNode:
-        if not uri:
-            uri = self.generate_random_string()
-        props = {"uri": uri}
-        if title is not None:
-            props["title"] = title
-        if description is not None:
-            props["description"] = description
-        q = f"CREATE (c:{self.CLASS_LABEL} $props) RETURN c"
-        with self._driver.session() as sess:
-            res = sess.run(q, {"props": props})
-            rec = res.single()
-            node = self.collect_node(rec["c"])
-            if parent_uri:
-                # создаём связь
-                q_rel = f"""
-                 MATCH (child:{self.CLASS_LABEL} {{uri:$child_uri}}), (parent:{self.CLASS_LABEL} {{uri:$parent_uri}})
-                 CREATE (child)-[:{self.REL_SUBCLASS}]->(parent)
-                 RETURN child, parent
-                 """
-                sess.run(q_rel, {"child_uri": uri, "parent_uri": parent_uri})
-            node["signature"] = self.collect_signature(uri)
-            return node
-
     def delete_class(self, uri: str) -> bool:
+        # unchanged behaviour: deletion by uri
         with self._driver.session() as sess:
             q_uris = f"""
             MATCH (c:{self.CLASS_LABEL} {{uri:$uri}})
@@ -448,13 +397,19 @@ class Neo4jRepository:
 
             return True
 
-    def add_class_attribute(self, class_uri: str, prop_uri: Optional[str] = None, title: Optional[str] = None) -> Dict[
-        str, Any]:
-        if not prop_uri:
-            prop_uri = self.generate_random_string()
+    # ------------------ Class attributes ------------------
+    def add_class_attribute(self, class_title: str, prop_title: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Create a DATATYPE property node and link it to class identified by class_title.
+        Property uri is generated internally. Returns created property node.
+        """
+        class_node = self._find_node_by_title(self.CLASS_LABEL, class_title)
+        if not class_node:
+            raise RepositoryError("Class with provided title not found.")
+        prop_uri = self.generate_random_string()
         props = {"uri": prop_uri}
-        if title:
-            props["title"] = title
+        if prop_title:
+            props["title"] = prop_title
         q = f"""
          MATCH (c:{self.CLASS_LABEL} {{uri:$class_uri}})
          CREATE (p:{self.DATATYPE_PROPERTY_LABEL} $props)
@@ -462,7 +417,7 @@ class Neo4jRepository:
          RETURN p
          """
         with self._driver.session() as sess:
-            res = sess.run(q, {"class_uri": class_uri, "props": props})
+            res = sess.run(q, {"class_uri": class_node["uri"], "props": props})
             rec = res.single()
             if not rec:
                 raise RepositoryError("Class not found or property creation failed.")
@@ -479,11 +434,16 @@ class Neo4jRepository:
             rec = res.single()
             return bool(rec and rec["cnt"] and rec["cnt"] > 0)
 
-    def add_class_object_attribute(self, class_uri: str, attr_uri: Optional[str] = None,
-                                   attr_title: Optional[str] = None, range_class_uri: Optional[str] = None) -> Dict[
-        str, Any]:
-        if not attr_uri:
-            attr_uri = self.generate_random_string()
+    def add_class_object_attribute(self, class_title: str, attr_title: Optional[str] = None,
+                                   range_class_title: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Create an OBJECT property linked to class identified by class_title. Range may be provided by range_class_title.
+        Property uri is generated internally.
+        """
+        class_node = self._find_node_by_title(self.CLASS_LABEL, class_title)
+        if not class_node:
+            raise RepositoryError("Class with provided title not found.")
+        attr_uri = self.generate_random_string()
         props = {"uri": attr_uri}
         if attr_title:
             props["title"] = attr_title
@@ -494,17 +454,20 @@ class Neo4jRepository:
          RETURN p
          """
         with self._driver.session() as sess:
-            res = sess.run(q, {"class_uri": class_uri, "props": props})
+            res = sess.run(q, {"class_uri": class_node["uri"], "props": props})
             rec = res.single()
             if not rec:
                 raise RepositoryError("Class not found or object property creation failed.")
             created = self.collect_node(rec["p"])
-            if range_class_uri:
+            if range_class_title:
+                range_node = self._find_node_by_title(self.CLASS_LABEL, range_class_title)
+                if not range_node:
+                    raise RepositoryError("Range class with provided title not found.")
                 q_range = f"""
                  MATCH (p:{self.OBJECT_PROPERTY_LABEL} {{uri:$p_uri}}), (r:{self.CLASS_LABEL} {{uri:$range_uri}})
                  CREATE (p)-[:{self.REL_PROPERTY_RANGE}]->(r)
                  """
-                sess.run(q_range, {"p_uri": attr_uri, "range_uri": range_class_uri})
+                sess.run(q_range, {"p_uri": attr_uri, "range_uri": range_node["uri"]})
             return created
 
     def delete_class_object_attribute(self, object_property_uri: str) -> bool:
@@ -525,13 +488,18 @@ class Neo4jRepository:
             rec = res.single()
             return bool(rec and rec["cnt"] and rec["cnt"] > 0)
 
-    def add_class_parent(self, parent_uri: str, target_uri: str) -> bool:
+    def add_class_parent(self, parent_title: str, target_title: str) -> bool:
         try:
-            self.create_arc(target_uri, parent_uri, rel_type=self.REL_SUBCLASS, props=None)
+            uri_parent = self._find_node_uri_by_title(self.CLASS_LABEL, parent_title)
+            uri_target = self._find_node_uri_by_title(self.CLASS_LABEL, target_title)
+            if not uri_parent or not uri_target:
+                return False
+            self.create_arc(uri_target, uri_parent, rel_type=self.REL_SUBCLASS, props=None)
             return True
         except RepositoryError:
             return False
 
+    # ------------------ Object CRUD ------------------
     def get_object(self, obj_uri: str) -> Optional[TNode]:
         node = self.get_node_by_uri(obj_uri)
         if not node:
@@ -562,14 +530,20 @@ class Neo4jRepository:
             rec = res.single()
             return bool(rec and rec["cnt"] and rec["cnt"] > 0)
 
-    def create_object(self, class_uri: str, obj_uri: Optional[str] = None, title: Optional[str] = None,
-                      description: Optional[str] = None, datatype_props: Optional[Dict[str, Any]] = None,
+    def create_object(self, class_title: str, obj_title: Optional[str] = None, description: Optional[str] = None,
+                      datatype_props: Optional[Dict[str, Any]] = None,
                       obj_params: Optional[List[Dict[str, Any]]] = None) -> TNode:
-        if not obj_uri:
-            obj_uri = self.generate_random_string()
-        props = {"uri": obj_uri, "class_uri": class_uri}
-        if title:
-            props["title"] = title
+        """
+        Create an object instance for class identified by class_title. Object `uri` is generated internally.
+        obj_params is a list of dicts with keys: prop_title (the property title to use as relationship name), target_title, direction (1 default means (this)->(target), -1 means reverse). Titles are used to find property and target nodes.
+        """
+        class_node = self._find_node_by_title(self.CLASS_LABEL, class_title)
+        if not class_node:
+            raise RepositoryError("Class with provided title not found.")
+        obj_uri = self.generate_random_string()
+        props = {"uri": obj_uri, "class_uri": class_node["uri"]}
+        if obj_title:
+            props["title"] = obj_title
         if description:
             props["description"] = description
         if datatype_props:
@@ -584,22 +558,33 @@ class Neo4jRepository:
                 raise RepositoryError("Object creation failed.")
             created = self.collect_node(rec["o"])
 
-        if obj_params:
-            for rel in obj_params:
-                prop_uri = rel.get("prop_uri")
-                target_uri = rel.get("target_uri")
-                direction = rel.get("direction", 1)
-                if not prop_uri or not target_uri:
-                    continue
-                try:
-                    if int(direction) == 1:
-                        # (this_obj) -[:prop]-> (target)
-                        self.create_arc(obj_uri, target_uri, rel_type=prop_uri, props=None)
-                    else:
-                        # (target) -[:prop]-> (this_obj)
-                        self.create_arc(target_uri, obj_uri, rel_type=prop_uri, props=None)
-                except RepositoryError:
-                    pass
+            # create TYPE relationship to class
+            q_type = f"MATCH (o:{self.OBJECT_LABEL} {{uri:$o_uri}}), (c:{self.CLASS_LABEL} {{uri:$c_uri}}) CREATE (o)-[:{self.REL_INSTANCE_OF}]->(c)"
+            sess.run(q_type, {"o_uri": obj_uri, "c_uri": class_node["uri"]})
+
+            # create object relationships
+            if obj_params:
+                for rel in obj_params:
+                    prop_title = rel.get("prop_title")
+                    target_title = rel.get("target_title")
+                    direction = rel.get("direction", 1)
+                    if not prop_title or not target_title:
+                        continue
+                    prop_node = self._find_node_by_title(self.OBJECT_PROPERTY_LABEL,
+                                                         prop_title) or self._find_node_by_title(
+                        self.DATATYPE_PROPERTY_LABEL, prop_title)
+                    target_node = self._find_node_by_title(None, target_title)
+                    if not prop_node or not target_node:
+                        continue
+                    try:
+                        rel_label = prop_node.get("uri")
+                        # create arc using uri namesafe
+                        if int(direction) == 1:
+                            self.create_arc(obj_uri, target_node["uri"], rel_type=rel_label, props=None)
+                        else:
+                            self.create_arc(target_node["uri"], obj_uri, rel_type=rel_label, props=None)
+                    except RepositoryError:
+                        pass
 
         return created
 
@@ -630,42 +615,55 @@ class Neo4jRepository:
 
             if obj_params_to_remove:
                 for rel in obj_params_to_remove:
-                    prop_uri = rel.get("prop_uri")
-                    target_uri = rel.get("target_uri")
+                    prop_title = rel.get("prop_title")
+                    target_title = rel.get("target_title")
                     direction = rel.get("direction", 1)
-                    if not prop_uri or not target_uri:
+                    if not prop_title or not target_title:
                         continue
-                    rel_label = _safe_label(prop_uri)
+                    prop_node = self._find_node_by_title(self.OBJECT_PROPERTY_LABEL,
+                                                         prop_title) or self._find_node_by_title(
+                        self.DATATYPE_PROPERTY_LABEL, prop_title)
+                    target_node = self._find_node_by_title(None, target_title)
+                    if not prop_node or not target_node:
+                        continue
+                    rel_label = _safe_label(prop_node.get("uri"))
                     if int(direction) == 1:
                         q_del = f"""
                           MATCH (a:{self.OBJECT_LABEL} {{uri:$a_uri}})-[r:`{rel_label}`]->(b {{uri:$b_uri}})
                           DELETE r
                           """
-                        sess.run(q_del, {"a_uri": obj_uri, "b_uri": target_uri})
+                        sess.run(q_del, {"a_uri": obj_uri, "b_uri": target_node["uri"]})
                     else:
                         q_del = f"""
-                          MATCH (b:{self.OBJECT_LABEL} {{uri:$b_uri}})-[r:`{rel_label}`]->(a {{uri:$a_uri}})
+                          MATCH (b {{uri:$b_uri}})-[r:`{rel_label}`]->(a:{self.OBJECT_LABEL} {{uri:$a_uri}})
                           DELETE r
                           """
-                        sess.run(q_del, {"a_uri": obj_uri, "b_uri": target_uri})
+                        sess.run(q_del, {"a_uri": obj_uri, "b_uri": target_node["uri"]})
 
             if obj_params_to_add:
                 for rel in obj_params_to_add:
-                    prop_uri = rel.get("prop_uri")
-                    target_uri = rel.get("target_uri")
+                    prop_title = rel.get("prop_title")
+                    target_title = rel.get("target_title")
                     direction = rel.get("direction", 1)
-                    if not prop_uri or not target_uri:
+                    if not prop_title or not target_title:
+                        continue
+                    prop_node = self._find_node_by_title(self.OBJECT_PROPERTY_LABEL,
+                                                         prop_title) or self._find_node_by_title(
+                        self.DATATYPE_PROPERTY_LABEL, prop_title)
+                    target_node = self._find_node_by_title(None, target_title)
+                    if not prop_node or not target_node:
                         continue
                     try:
                         if int(direction) == 1:
-                            self.create_arc(obj_uri, target_uri, rel_type=prop_uri, props=None)
+                            self.create_arc(obj_uri, target_node["uri"], rel_type=prop_node.get("uri"), props=None)
                         else:
-                            self.create_arc(target_uri, obj_uri, rel_type=prop_uri, props=None)
+                            self.create_arc(target_node["uri"], obj_uri, rel_type=prop_node.get("uri"), props=None)
                     except RepositoryError:
                         pass
 
         return self.get_object(obj_uri)
 
+    # ------------------ Signature / Schema discovery ------------------
     def collect_signature(self, class_uri: str) -> Dict[str, Any]:
         params = []
         obj_params = []
@@ -729,11 +727,8 @@ class Neo4jRepository:
 
         return {"params": params, "obj_params": obj_params}
 
+    # ------------------ Conversion helpers ------------------
     def _convert_value(self, v):
-        # Convert neo4j types to python simple types if needed
-        # e.g., DateTime, Node, Relationship etc. For simplicity, we convert
-        # nodes/relationships to ids or dicts.
-        # If something complex, fallback to str()
         try:
             from neo4j.time import DateTime, Date, Time, Duration
             if isinstance(v, (DateTime, Date, Time, Duration)):
@@ -756,98 +751,141 @@ class Neo4jRepository:
             return [self._convert_value(x) for x in v]
         return v
 
+    def collect_node(self, node_obj) -> TNode:
+        try:
+            eid = node_obj.element_id
+        except Exception:
+            eid = None
+        data = {"id": eid}
+        try:
+            for k in node_obj.keys():
+                data[k] = self._convert_value(node_obj[k])
+        except Exception:
+            try:
+                for k, v in dict(node_obj).items():
+                    data[k] = self._convert_value(v)
+            except Exception:
+                pass
+        data.setdefault("uri", data.get("uri", None))
+        data.setdefault("title", data.get("title", None))
+        data.setdefault("description", data.get("description", None))
+        return data
+
+    def collect_arc(self, rel_obj, target_node=None) -> TArc:
+        try:
+            eid = rel_obj.element_id
+        except Exception:
+            eid = None
+
+        rel_type = getattr(rel_obj, "type", None) or type(rel_obj).__name__
+
+        props = {}
+        try:
+            for k in rel_obj.keys():
+                props[k] = self._convert_value(rel_obj[k])
+        except Exception:
+            pass
+
+        node_from_uri = None
+        node_to_uri = None
+        try:
+            sn = rel_obj.start_node
+            en = rel_obj.end_node
+            node_from_uri = sn.get("uri", None)
+            node_to_uri = en.get("uri", None)
+        except Exception:
+            if target_node is not None:
+                node_to_uri = target_node.get("uri", None)
+
+        arc = {
+            "id": eid,
+            "uri": rel_type,
+            "node_uri_from": node_from_uri,
+            "node_uri_to": node_to_uri,
+        }
+        if props:
+            arc["props"] = props
+        return arc
+
+
+# End of file
+
 
 if __name__ == "__main__":
     import os
+    import json
     import dotenv
+
     dotenv.load_dotenv()
     NEO4J_URI = os.getenv("NEO4J_URI")
     NEO4J_USER = os.getenv("NEO4J_USER")
     NEO4J_PASS = os.getenv("NEO4J_PASSWORD")
 
     repo = Neo4jRepository(NEO4J_URI, NEO4J_USER, NEO4J_PASS)
+
     try:
-        print("Creating two test nodes...")
-        a = repo.create_node({"title": "Node A", "description": "First", "uri": "node-a-001"}, labels=["Test"])
-        b = repo.create_node({"title": "Node B", "description": "Second", "uri": "node-b-001"}, labels=["Test"])
-        print("A:", a)
-        print("B:", b)
+        print("\n=== DEMO: Complex ontology for collect_node ===")
 
-        print("Creating an arc from A to B ...")
-        arc = repo.create_arc("node-a-001", "node-b-001", rel_type="LINKS", props={"weight": 3})
-        print("Arc created:", arc)
+        # === Создание классов ===
+        person = repo.create_class(title="Person", description="Human being")
+        employee = repo.create_class(title="Employee", description="Employee of company", parent_title="Person")
+        manager = repo.create_class(title="Manager", description="Manages employees", parent_title="Employee")
+        project = repo.create_class(title="Project", description="Project entity")
 
-        print("Get all nodes and arcs:")
-        all_na = repo.get_all_nodes_and_arcs()
-        print(json.dumps(all_na, indent=2, ensure_ascii=False))
+        print("Classes created:", person["uri"], employee["uri"], manager["uri"], project["uri"])
 
-        print("Update node A:")
-        updated = repo.update_node("node-a-001", {"description": "Updated desc"}, set_labels=["UpdatedLabel"])
-        print("Updated:", updated)
+        p_name = repo.add_class_attribute(class_title="Person", prop_title="name")
+        p_age = repo.add_class_attribute(class_title="Person", prop_title="age")
+        e_salary = repo.add_class_attribute(class_title="Employee", prop_title="salary")
 
-        print("Run custom query (count):")
-        res = repo.run_custom_query("MATCH (n:Test) RETURN count(n) as cnt")
-        print(res)
+        # === Object Properties ===
+        op_manager_of = repo.add_class_object_attribute(
+            class_title="Manager",
+            attr_title="managerOf",
+            range_class_title="Employee"
+        )
+        op_works_on = repo.add_class_object_attribute(
+            class_title="Employee",
+            attr_title="worksOn",
+            range_class_title="Project"
+        )
 
-        print("Cleanup: delete arc by element_id and nodes")
-        if isinstance(arc.get("id"), str) and arc.get("id"):
-            repo.delete_arc_by_element_id(arc["id"])
-        repo.delete_node_by_uri("node-a-001")
-        repo.delete_node_by_uri("node-b-001")
-        print("\n=== Ontology Test (Class / Properties) ===")
+        alice = repo.create_object(
+            class_title="Manager",
+            obj_title="Alice",
+            datatype_props={"name": "Alice", "age": 42}
+        )
+        bob = repo.create_object(
+            class_title="Employee",
+            obj_title="Bob",
+            datatype_props={"name": "Bob", "age": 30, "salary": 70000}
+        )
+        carol = repo.create_object(
+            class_title="Employee",
+            obj_title="Carol",
+            datatype_props={"name": "Carol", "age": 28, "salary": 65000}
+        )
+        projx = repo.create_object(
+            class_title="Project",
+            obj_title="Project X"
+        )
 
-        ca = repo.create_class(uri="class-A", title="Class A")
-        cb = repo.create_class(uri="class-B", title="Class B", parent_uri="class-A")
+        mgr_node = repo.get_node_by_title("Class", "Manager")
+        print("\nCollected node for Class:Manager (collect_node output):")
+        print(json.dumps(mgr_node, indent=2, ensure_ascii=False))
 
+        print("\nCollect signature for Class:Manager (params + obj_params):")
+        sig_mgr = repo.collect_signature(repo.get_class_by_title("Manager")["uri"])
+        print(json.dumps(sig_mgr, indent=2, ensure_ascii=False))
 
-        dp = repo.add_class_attribute("class-A", prop_uri="dp-age", title="age")
-        op = repo.add_class_object_attribute("class-A", attr_uri="op-to-b", attr_title="toB", range_class_uri="class-B")
+        all_nodes_and_arcs = repo.get_all_nodes_and_arcs()
+        print("\nSample of get_all_nodes_and_arcs (show first 6 nodes):")
+        print(json.dumps(all_nodes_and_arcs[:6], indent=2, ensure_ascii=False))
 
-        o1 = repo.create_object("class-A", obj_uri="obj-a-1", title="ObjA1", datatype_props={"age": 30})
-        o2 = repo.create_object("class-B", obj_uri="obj-b-1", title="ObjB1",
-                                obj_params=[{"prop_uri": "op-to-b", "target_uri": "obj-a-1", "direction": -1}])
-        print("Objects of class-A:", repo.get_class_objects("class-A"))
-        print("Objects of class-B:", repo.get_class_objects("class-B"))
+        alice_node = repo.get_node_by_title("Object", "Alice")
+        print("\nCollected node for Alice (object instance):")
+        print(json.dumps(alice_node, indent=2, ensure_ascii=False))
 
-        deleted = repo.delete_class("class-A")
-        print("Class A deleted:", deleted)
-        print("get_node_by_uri class-A:", repo.get_node_by_uri("class-A"))
-        print("get_node_by_uri class-B:", repo.get_node_by_uri("class-B"))
-        print("get_node_by_uri obj-a-1:", repo.get_node_by_uri("obj-a-1"))
-        print("get_node_by_uri dp-age:", repo.get_node_by_uri("dp-age"))
-        print("get_node_by_uri op-to-b:", repo.get_node_by_uri("op-to-b"))
-
-        print("\nTest: create_node with existing uri (should update, not duplicate)")
-        node_a1 = repo.create_node({"uri": "node-a-001", "title": "Node A v2", "description": "Updated again"},
-                                   labels=["TestLabel"])
-        print("Node A (recreated):", node_a1)
-        nodes_a = repo.get_node_by_uri("node-a-001")
-        print("All Node A with same uri:", nodes_a)
-
-        print("\nTest: create_arc with missing node (should raise RepositoryError)")
-        try:
-            repo.create_arc("node-a-001", "non-existent-uri", "BROKEN")
-        except RepositoryError as e:
-            print("Expected error:", e)
-
-        print("\nTest: delete_class_attribute")
-        deleted = repo.delete_class_attribute("dp-age")
-        print("Datatype property dp-age deleted:", deleted)
-
-        print("\nTest: delete_class_object_attribute")
-        deleted_objprop = repo.delete_class_object_attribute("op_to_b")
-        print("Object property op-to-b deleted:", deleted_objprop)
-
-        print("\nTest: get_objects_of_class after class deletion")
-        objs_A = repo.get_class_objects("class-A")
-        print("Objects of class-A after deletion:", objs_A)
-
-        print("\nTest: run custom query (list all uris)")
-        q = "MATCH (n) RETURN n.uri as uri LIMIT 10"
-        res = repo.run_custom_query(q)
-        print("Sample uris:", res)
-
-        repo.close()
 
     finally:
         repo.close()
