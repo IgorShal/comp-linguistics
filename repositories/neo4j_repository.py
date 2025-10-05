@@ -681,7 +681,8 @@ class Neo4jRepository:
 
             q_dt_inherited = f"""
              MATCH (s:{self.CLASS_LABEL} {{uri:$uri}})
-             MATCH (x:{self.CLASS_LABEL})-[:{self.REL_SUBCLASS}*]->(s)
+             MATCH (x:{self.CLASS_LABEL})
+             WHERE (s)-[:{self.REL_SUBCLASS}*]->(x)
              MATCH (p:{self.DATATYPE_PROPERTY_LABEL})-[:{self.REL_PROPERTY_DOMAIN}]->(x)
              RETURN DISTINCT p
              """
@@ -807,6 +808,35 @@ class Neo4jRepository:
             arc["props"] = props
         return arc
 
+    def delete_arc_by_id(self, arc_id: str) -> bool:
+        """
+        Delete a relationship (arc) by its internal Neo4j id(r).
+        Returns True if something was deleted, False otherwise.
+        """
+        q = "MATCH ()-[r]-() WHERE id(r) = $rid DELETE r RETURN COUNT(r) as cnt"
+        with self._driver.session() as sess:
+            res = sess.run(q, {"rid": int(arc_id)})
+            rec = res.single()
+            return bool(rec and rec["cnt"] and rec["cnt"] > 0)
+
+    def run_custom_query(self, query: str) -> List[Dict[str, Any]]:
+        """
+        Run an arbitrary Cypher query and return a list of dicts with converted values.
+        This should only be used for read/debug operations — use parameterized Cypher for writes.
+        """
+        with self._driver.session() as sess:
+            try:
+                res = sess.run(query)
+                records = []
+                for r in res:
+                    rec_dict = {}
+                    for k in r.keys():
+                        rec_dict[k] = self._convert_value(r[k])
+                    records.append(rec_dict)
+                return records
+            except Exception as e:
+                raise RepositoryError(f"Error running custom query: {e}")
+
 
 # End of file
 
@@ -824,6 +854,7 @@ if __name__ == "__main__":
     repo = Neo4jRepository(NEO4J_URI, NEO4J_USER, NEO4J_PASS)
 
     try:
+        repo.run_custom_query("MATCH (n) DETACH DELETE n")
         print("\n=== DEMO: Complex ontology for collect_node ===")
 
         # === Создание классов ===
@@ -885,6 +916,8 @@ if __name__ == "__main__":
         alice_node = repo.get_node_by_title("Object", "Alice")
         print("\nCollected node for Alice (object instance):")
         print(json.dumps(alice_node, indent=2, ensure_ascii=False))
+
+        print(repo.collect_signature(alice_node["uri"]))
 
 
     finally:
