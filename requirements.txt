@@ -1,6 +1,0 @@
-django>=4.2,<5.0
-djangorestframework>=3.14,<4.0
-python-dotenv>=1.0.0
-neo4j>=5.0
-pytest>=8.0
-
