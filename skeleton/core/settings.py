@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/3.0/ref/settings/
 
 import os
 import sys
+from dotenv import load_dotenv
 import dj_database_url
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -20,6 +21,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PARENT_DIR = os.path.dirname(BASE_DIR)
 if PARENT_DIR not in sys.path:
     sys.path.append(PARENT_DIR)
+
+# Load environment variables from .env (project root and parent root)
+load_dotenv(os.path.join(BASE_DIR, '.env'))
+load_dotenv(os.path.join(PARENT_DIR, '.env'))
 
 
 # DB_URI = 'bolt://localhost:7687'

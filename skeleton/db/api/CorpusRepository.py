@@ -31,12 +31,9 @@ class CorpusRepository:
 
     def update(self, corpus_id: int, data: Dict[str, Any]) -> Dict[str, Any]:
         c = Corpus.objects.get(pk=corpus_id)
-        if 'name' in data:
-            c.name = data['name']
-        if 'description' in data:
-            c.description = data['description']
-        if 'genre' in data:
-            c.genre = data['genre']
+        c.name = data.get('name', '')
+        c.description = data.get('description', '')
+        c.genre = data.get('genre', '')
         c.save()
         return self.collect_corpus(c)
 

@@ -34,3 +34,4 @@ django-sendfile
 neo4j
 pyjwt
 legacy-cgi
+dotenv

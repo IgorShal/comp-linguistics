@@ -31,17 +31,16 @@ class TextRepository:
 
     def update(self, text_id: int, data: Dict[str, Any]) -> Dict[str, Any]:
         t = Text.objects.get(pk=text_id)
-        if 'title' in data:
-            t.title = data['title']
-        if 'description' in data:
-            t.description = data['description']
-        if 'text' in data:
-            t.text = data['text']
-        if 'corpus_id' in data:
-            t.corpus = Corpus.objects.get(pk=data['corpus_id'])
+        t.title = data.get('title', t.title)
+        t.description = data.get('description', t.description)
+        t.text = data.get('text', t.text)
+        t.corpus = Corpus.objects.get(pk=data.get('corpus_id', t.corpus_id))
         t.save()
-        if 'has_translation_ids' in data:
-            t.has_translation.set(Text.objects.filter(pk__in=(data.get('has_translation_ids') or [])))
+        t.has_translation.set(
+            Text.objects.filter(
+                pk__in=(data.get('has_translation_ids', list(t.has_translation.values_list('id', flat=True))))
+            )
+        )
         return self.collect_text(t)
 
     def get(self, text_id: int) -> Dict[str, Any]:
