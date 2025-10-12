@@ -1,6 +1,7 @@
 from typing import List
 from sentence_transformers import SentenceTransformer
 import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 class EmbeddingsGenerator:
@@ -18,10 +19,8 @@ class EmbeddingsGenerator:
         return embeddings
 
     @staticmethod
-    def cos_compare(embedding_list_first: np.ndarray, embedding_list_second: np.ndarray) -> np.ndarray:
-        cosine_similarity = np.dot(embedding_list_first, embedding_list_second) / (
-                np.linalg.norm(embedding_list_first) * np.linalg.norm(embedding_list_second))
-        return cosine_similarity
+    def cos_compare(embedding_first: np.ndarray, embedding_second: np.ndarray) -> np.ndarray:
+        return cosine_similarity([embedding_first], [embedding_second])[0][0]
 
 
 if __name__ == '__main__':
