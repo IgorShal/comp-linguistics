@@ -13,6 +13,8 @@ from db.views import (
     update_text,
     get_text,
     delete_text,
+    find_similar_texts,
+    search_texts_by_query,
     ontology_get_all_nodes,
     ontology_create_class,
     ontology_get_ontology,
@@ -59,6 +61,8 @@ urlpatterns = [
     path('text/update', update_text, name='update_text'),
     path('text/get', get_text, name='get_text'),
     path('text/delete', delete_text, name='delete_text'),
+    path('text/find_similar', find_similar_texts, name='find_similar_texts'),
+    path('text/search', search_texts_by_query, name='search_texts_by_query'),
     # Ontology
     path('ontology/nodes', ontology_get_all_nodes, name='ontology_get_all_nodes'),
     path('ontology/create_class', ontology_create_class, name='ontology_create_class'),

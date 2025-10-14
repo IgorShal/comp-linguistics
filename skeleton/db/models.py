@@ -22,8 +22,10 @@ class Text(models.Model):
     description = models.TextField(blank=True, null=True)
     text = models.TextField()
     corpus = models.ForeignKey(Corpus, on_delete=models.CASCADE, related_name='texts')
-    # Self-relationship for translations; asymmetrical to preserve direction
+
     has_translation = models.ManyToManyField('self', symmetrical=False, blank=True, related_name='is_translation_of')
+    # Embedding vector (stored as JSON string, compatible with Django 3.0)
+    embedding = models.TextField(blank=True, null=True)
 
     def __str__(self):
         return self.title

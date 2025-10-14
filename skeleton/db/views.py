@@ -123,6 +123,27 @@ def delete_text(request):
     repo = TextRepository()
     return JsonResponse({'deleted': repo.delete(int(text_id))})
 
+@api_view(['GET'])
+@permission_classes((AllowAny,))
+def find_similar_texts(request):
+    text_id = request.GET.get('id')
+    limit = int(request.GET.get('limit', 5))
+    if text_id is None:
+        return HttpResponse(status=400)
+    repo = TextRepository()
+    return JsonResponse(repo.find_similar(int(text_id), limit))
+
+@api_view(['POST'])
+@permission_classes((AllowAny,))
+def search_texts_by_query(request):
+    data = json.loads(request.body.decode('utf-8'))
+    query_text = data.get('query')
+    limit = data.get('limit', 5)
+    if not query_text:
+        return HttpResponse(status=400)
+    repo = TextRepository()
+    return JsonResponse(repo.search_by_text(query_text, limit))
+
 # ===== Ontology endpoints (delegating to OntologyRepository) =====
 @api_view(['GET'])
 @permission_classes((AllowAny,))
