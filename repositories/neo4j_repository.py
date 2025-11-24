@@ -3,7 +3,8 @@ import uuid
 from typing import List, Dict, Any, Optional
 
 from neo4j import GraphDatabase, Driver
-
+from typing import Iterable
+import numpy as np
 from utils.helpers import _safe_label, TNode, TArc, _LABEL_RE
 from utils.repository_error import RepositoryError
 
@@ -837,6 +838,144 @@ class Neo4jRepository:
             except Exception as e:
                 raise RepositoryError(f"Error running custom query: {e}")
 
+    # ------------------ Fragment + Embedding helpers for RAG ------------------
+
+    def collect_fragment_for_node(self, uri: str) -> str:
+        """
+        Build a concise textual fragment for a node (used as retrieval unit).
+        Includes: title, description, datatype props, linked object titles, neighbor class/object short info.
+        Returns a single string.
+        """
+        node = self.get_node_by_uri(uri)
+        if not node:
+            return ""
+
+        parts = []
+        title = node.get("title")
+        if title:
+            parts.append(f"Название: {title}")
+        # include common simple props (like firstname/lastname, description, other datatype properties)
+        desc = node.get("description")
+        if desc:
+            parts.append(f"Описание: {desc}")
+
+        # Any other scalar props (exclude internal props like uri, id)
+        scalar_props = []
+        for k, v in node.items():
+            if k in ("uri", "id", "title", "description", "arcs", "class", "parents", "signature", "embedding"):
+                continue
+            # only include basic scalars
+            if isinstance(v, (str, int, float, bool)):
+                scalar_props.append(f"{k}: {v}")
+        if scalar_props:
+            parts.append(" ".join(scalar_props))
+
+        # include signature (params and object props) if available
+        try:
+            signature = self.collect_signature(node.get("uri"))
+            params = signature.get("params") or []
+            obj_params = signature.get("obj_params") or []
+            if params:
+                params_list = ", ".join([p.get("title") or "" for p in params])
+                parts.append(f"Атрибуты (datatype): {params_list}")
+            if obj_params:
+                obj_list = []
+                for op in obj_params:
+                    title_op = op.get("title") or ""
+                    target = op.get("target_class_url") or ""
+                    dirn = op.get("relation_direction", 1)
+                    if dirn == 1:
+                        obj_list.append(f"{title_op} -> {target}")
+                    else:
+                        obj_list.append(f"{title_op} <- {target}")
+                parts.append("Объектные отношения: " + "; ".join(obj_list))
+        except Exception:
+            pass
+
+        # include immediate neighbors titles via arcs (first-level)
+        try:
+            q = "MATCH (n {uri:$uri})-[r]-(m) RETURN DISTINCT m.title as t LIMIT 20"
+            with self._driver.session() as sess:
+                res = sess.run(q, {"uri": uri})
+                neigh = [r["t"] for r in res if r.get("t")]
+                if neigh:
+                    parts.append("Связанные узлы: " + ", ".join(neigh[:20]))
+        except Exception:
+            pass
+
+        fragment = "\n".join(parts)
+        return fragment
+
+    def set_node_embedding(self, uri: str, embedding: Iterable[float]) -> bool:
+        """
+        Store embedding (list of floats) on node property `embedding`.
+        Neo4j supports list of numbers as property (if version supports). Uses parameterized query.
+        Returns True if updated.
+        """
+        q = "MATCH (n {uri:$uri}) SET n.embedding = $emb RETURN COUNT(n) as cnt"
+        emb_list = list(map(float, embedding))
+        with self._driver.session() as sess:
+            res = sess.run(q, {"uri": uri, "emb": emb_list})
+            rec = res.single()
+            return bool(rec and rec.get("cnt", 0) > 0)
+
+    def get_nodes_with_embeddings(self) -> List[TNode]:
+        """
+        Return all nodes that have non-null embedding property.
+        """
+        q = "MATCH (n) WHERE exists(n.embedding) AND n.embedding <> [] RETURN n"
+        with self._driver.session() as sess:
+            res = sess.run(q)
+            return [self.collect_node(r["n"]) for r in res]
+
+    def compute_and_store_embedding_for_node(self, uri: str, emb_generator) -> Optional[List[float]]:
+        """
+        Compute text fragment for node, get embedding from emb_generator, and store it.
+        emb_generator must have get_text_embedding(text) -> numpy array or list.
+        Returns embedding list or None.
+        """
+        fragment = self.collect_fragment_for_node(uri)
+        if not fragment:
+            return None
+        try:
+            emb = emb_generator.get_text_embedding(fragment)
+            # emb may be numpy array — convert to python list
+            emb_list = emb.tolist() if hasattr(emb, "tolist") else list(emb)
+            ok = self.set_node_embedding(uri, emb_list)
+            if ok:
+                return emb_list
+            return None
+        except Exception as e:
+            # don't fail hard, just return None
+            return None
+
+    def search_nodes_by_embedding(self, query_embedding: Iterable[float], top_k: int = 10) -> List[Dict[str, Any]]:
+        """
+        Simple O(N) semantic search: load all nodes with embeddings, compute cosine similarity, return top_k list
+        Each entry: {'node': <collected_node>, 'similarity': float}
+        """
+        import numpy as np
+        qnodes = self.get_nodes_with_embeddings()
+        qemb = np.array(list(map(float, query_embedding)))
+        scored = []
+        for n in qnodes:
+            emb = n.get("embedding")
+            if emb is None:
+                continue
+            try:
+                emb_arr = np.array(emb, dtype=float)
+                # cosine similarity: (a·b) / (||a||*||b||)
+                # Use dot / norms via numpy for stability
+                denom = (np.linalg.norm(qemb) * np.linalg.norm(emb_arr))
+                if denom == 0:
+                    sim = 0.0
+                else:
+                    sim = float(np.dot(qemb, emb_arr) / denom)
+                scored.append({"node": n, "similarity": sim})
+            except Exception:
+                continue
+        scored.sort(key=lambda x: x["similarity"], reverse=True)
+        return scored[:top_k]
 
 # End of file
 

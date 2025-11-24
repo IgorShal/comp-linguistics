@@ -25,7 +25,6 @@ class EmbeddingsGenerator:
         return embeddings
 
     def get_text_embedding(self, text: str) -> np.ndarray:
-        """Generate embedding for a single text."""
         return self._model.encode([text])[0]
 
     @staticmethod
