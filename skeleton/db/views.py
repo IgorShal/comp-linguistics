@@ -21,6 +21,7 @@ from db.api.CorpusRepository import CorpusRepository
 from db.api.TextRepository import TextRepository
 from db.api.OntologyRepository import OntologyRepository
 
+
 @api_view(['GET', ])
 @permission_classes((AllowAny,))
 def getTest(request):

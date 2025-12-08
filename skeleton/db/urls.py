@@ -1,5 +1,7 @@
 from django.urls import path
-from django.conf.urls import url
+from drf_yasg import openapi
+from drf_yasg.views import get_schema_view
+from rest_framework import permissions
 
 from db.views import (
     getTest,
@@ -45,6 +47,18 @@ from db.views import (
     ontology_delete_object,
     ontology_update_node,
     ontology_collect_signature,
+)
+schema_view = get_schema_view(
+    openapi.Info(
+        title="Your API",
+        default_version='v1',
+        description="API Documentation",
+        terms_of_service="https://www.google.com/policies/terms/",
+        contact=openapi.Contact(email="contact@example.com"),
+        license=openapi.License(name="BSD License"),
+    ),
+    public=True,
+    permission_classes=[permissions.AllowAny],  # Разрешаем доступ всем
 )
 
 urlpatterns = [
@@ -94,4 +108,5 @@ urlpatterns = [
     path('ontology/delete_object', ontology_delete_object, name='ontology_delete_object'),
     path('ontology/update_node', ontology_update_node, name='ontology_update_node'),
     path('ontology/collect_signature', ontology_collect_signature, name='ontology_collect_signature'),
+    path('docs/', schema_view.with_ui('swagger', cache_timeout=0)),
 ]

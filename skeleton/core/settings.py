@@ -60,6 +60,7 @@ INSTALLED_APPS = [
     'rest_framework.authtoken',
     'db_file_storage',
     'db',
+    'drf_yasg',
 ]
 
 REST_FRAMEWORK = {
