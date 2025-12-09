@@ -58,6 +58,20 @@ def _map_node_label(data_labels: List[str], repo: "Neo4jRepository") -> List[str
             return [repo.DATATYPE_PROPERTY_LABEL]
     return ["Imported"]
 
+# простая транслитерация для кириллицы в латиницу, чтобы имена связей были читабельны
+_RU_EN = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya"
+})
+
+def _transliterate(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    return text.lower().translate(_RU_EN)
+
 def sanitize_props(props: Dict[str, Any]) -> Dict[str, Any]:
     def sanitize_value(v):
         if v is None or isinstance(v, (str, int, float, bool)):
@@ -111,6 +125,7 @@ def import_graph_to_repo_fixed(repo: "Neo4jRepository", nodes: List[Dict[str, An
       - возвращаем сводку с mapping external_uri -> internal_uri и ошибками.
     """
     results = {"created_nodes": 0, "created_arcs": 0, "node_errors": [], "arc_errors": []}
+    unresolved_rel_labels: List[Dict[str, Any]] = []
     external_to_internal: Dict[str, str] = {}
 
     def _descriptor_data(desc: Dict[str, Any]) -> Dict[str, Any]:
@@ -190,20 +205,30 @@ def import_graph_to_repo_fixed(repo: "Neo4jRepository", nodes: List[Dict[str, An
 
     # Соберём все уникальные дескрипторы нод (из nodes + вложенных в arcs)
     descriptors_by_uri: Dict[str, Dict[str, Any]] = {}
+    primary_descriptors: Dict[str, Dict[str, Any]] = {}
+    def _store_descriptor(ext: str, desc: Dict[str, Any], primary: bool = False):
+        if not ext or not desc:
+            return
+        if primary and ext not in primary_descriptors:
+            primary_descriptors[ext] = desc
+        if ext not in descriptors_by_uri:
+            descriptors_by_uri[ext] = desc
+        tail = ext.rstrip("/").split("/")[-1]
+        if tail and tail not in descriptors_by_uri:
+            descriptors_by_uri[tail] = desc
+
     for n in nodes:
         ext = _descriptor_uri(n)
-        if ext and ext not in descriptors_by_uri:
-            descriptors_by_uri[ext] = n
+        _store_descriptor(ext, n, primary=True)
     for a in arcs:
         ad = a.get("data") or {}
         for key in ("start_node", "end_node"):
             desc = ad.get(key)
             ext = _descriptor_uri(desc)
-            if ext and ext not in descriptors_by_uri:
-                descriptors_by_uri[ext] = desc
+            _store_descriptor(ext, desc, primary=True)
 
     # Создаём ноды из подготовленных дескрипторов
-    for ext, desc in descriptors_by_uri.items():
+    for ext, desc in primary_descriptors.items():
         try:
             created = _create_node_from_descriptor(desc)
             external_to_internal[ext] = created.get("uri")
@@ -233,8 +258,27 @@ def import_graph_to_repo_fixed(repo: "Neo4jRepository", nodes: List[Dict[str, An
             uri2 = external_to_internal[target_ext]
 
             rel_uri = a.get("uri") or arc_data.get("uri") or (arc_data.get("labels") or [None])[0] or a.get("id")
-            rel_type = _sanitize_rel_type(rel_uri)
-            rel_props = sanitize_props({"predicate_uri": rel_uri})
+            rel_label_raw = None
+            # если uri рёбра указывает на ноду-предикат — достанем её метку
+            desc_rel = _find_descriptor_by_key(rel_uri)
+            if desc_rel:
+                rel_label_raw = _extract_label(_descriptor_data(desc_rel))
+            if not rel_label_raw:
+                # fallback: хвост URI или сам uri
+                rel_label_raw = rel_uri.rstrip("/").split("/")[-1] if isinstance(rel_uri, str) else rel_uri
+                unresolved_rel_labels.append({"arc_id": a.get("id"), "uri": rel_uri, "rel_label_used": rel_label_raw})
+            rel_label_translit = _transliterate(rel_label_raw) if isinstance(rel_label_raw, str) else ""
+            rel_type_from_label = _sanitize_rel_type(rel_label_translit or (rel_label_raw if isinstance(rel_label_raw, str) else ""))
+            rel_type_from_uri = _sanitize_rel_type(rel_uri if isinstance(rel_uri, str) else "")
+            # если метка на кириллице/пустая после санитайза — используем хвост uri/RELATED
+            rel_type = rel_type_from_label if re.search(r"[A-Za-z0-9]", rel_type_from_label) else rel_type_from_uri
+            if not re.search(r"[A-Za-z0-9]", rel_type):
+                rel_type = "RELATED"
+            rel_props = sanitize_props({
+                "predicate_uri": rel_uri,
+                "predicate_uri_tail": rel_uri.rstrip("/").split("/")[-1] if isinstance(rel_uri, str) else rel_uri,
+                "predicate_label": rel_label_raw
+            })
 
             repo.create_arc(uri1, uri2, rel_type=rel_type, props=rel_props)
             results["created_arcs"] += 1
@@ -242,6 +286,8 @@ def import_graph_to_repo_fixed(repo: "Neo4jRepository", nodes: List[Dict[str, An
             results["arc_errors"].append({"arc": a.get("id") or (a.get("data") or {}).get("uri"), "error": str(e)})
 
     results["mapping"] = external_to_internal
+    if unresolved_rel_labels:
+        results["unresolved_rel_labels"] = unresolved_rel_labels
     return results
 
 
